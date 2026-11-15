@@ -83,15 +83,13 @@ pub fn parse_text_operations(tid: &[u8]) -> Result<Vec<TextOp>> {
         .and_then(Plist::as_dictionary)
         .ok_or_else(|| Error::Protocol("_tiD has no textOperations".into()))?;
 
-    let mut ops = Vec::new();
-    if let Some(text) = operations
+    let assert_text = operations
         .get("textToAssert")
         .and_then(|v| resolve(objects, v))
         .and_then(Plist::as_string)
-    {
-        ops.push(TextOp::Replace(text.to_string()));
-    }
-    if let Some(output) = operations
+        .map(str::to_string);
+
+    let (deletion, insert_text) = if let Some(output) = operations
         .get("keyboardOutput")
         .and_then(|v| resolve(objects, v))
         .and_then(Plist::as_dictionary)
@@ -101,18 +99,37 @@ pub fn parse_text_operations(tid: &[u8]) -> Result<Vec<TextOp>> {
             .and_then(|v| resolve(objects, v))
             .and_then(Plist::as_unsigned_integer)
             .unwrap_or(0);
-        if deletion > 0 {
-            ops.push(TextOp::Delete(u32::try_from(deletion).unwrap_or(u32::MAX)));
-        }
-        if let Some(text) = output
+        let insert_text = output
             .get("insertionText")
             .and_then(|v| resolve(objects, v))
             .and_then(Plist::as_string)
-        {
-            if !text.is_empty() {
-                ops.push(TextOp::Insert(text.to_string()));
-            }
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        (deletion, insert_text)
+    } else {
+        (0, None)
+    };
+
+    let mut ops = Vec::new();
+    if let Some(asserted) = assert_text {
+        // When `textToAssert` and `keyboardOutput.insertionText` arrive in the
+        // same packet and `textToAssert` already ends with `insertionText`
+        // (e.g. Chinese IME/dictation sets both to "你好"), emitting both
+        // `Replace` and `Insert` would type the text twice.
+        let covered_by_assert = deletion == 0
+            && insert_text
+                .as_deref()
+                .is_some_and(|ins| !ins.is_empty() && asserted.ends_with(ins));
+        ops.push(TextOp::Replace(asserted));
+        if covered_by_assert {
+            return Ok(ops);
         }
+    }
+    if deletion > 0 {
+        ops.push(TextOp::Delete(u32::try_from(deletion).unwrap_or(u32::MAX)));
+    }
+    if let Some(text) = insert_text {
+        ops.push(TextOp::Insert(text));
     }
     Ok(ops)
 }
@@ -295,6 +312,38 @@ mod tests {
         assert_eq!(
             parse_text_operations(TIC_ASSERT_TEXT).unwrap(),
             vec![TextOp::Replace("привет ".into())]
+        );
+    }
+
+    #[test]
+    fn deduplicates_combined_assert_and_insert() {
+        let mut keyboard_output = Dictionary::new();
+        keyboard_output.insert("deletionCount".into(), Plist::Integer(0_u64.into()));
+        keyboard_output.insert("insertionText".into(), Plist::Uid(Uid::new(3)));
+
+        let mut text_ops = Dictionary::new();
+        text_ops.insert("textToAssert".into(), Plist::Uid(Uid::new(3)));
+        text_ops.insert("keyboardOutput".into(), Plist::Uid(Uid::new(2)));
+
+        let mut top = Dictionary::new();
+        top.insert("textOperations".into(), Plist::Uid(Uid::new(1)));
+
+        let objects = vec![
+            Plist::String("$null".into()),
+            Plist::Dictionary(text_ops),
+            Plist::Dictionary(keyboard_output),
+            Plist::String("你好".into()),
+        ];
+
+        let mut root = Dictionary::new();
+        root.insert("$top".into(), Plist::Dictionary(top));
+        root.insert("$objects".into(), Plist::Array(objects));
+
+        let mut bytes = Vec::new();
+        Plist::Dictionary(root).to_writer_binary(&mut bytes).unwrap();
+        assert_eq!(
+            parse_text_operations(&bytes).unwrap(),
+            vec![TextOp::Replace("你好".into())]
         );
     }
 

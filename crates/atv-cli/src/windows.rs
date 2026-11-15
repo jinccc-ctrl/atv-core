@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atv_core::{AtvDelegate, EventKind, TextOp, TouchPhase, TrackpadMode};
 use tracing::{debug, info, warn};
@@ -82,14 +82,12 @@ const WHEEL_DELTA: i32 = 120;
 const VK_BACK: u8 = 0x08;
 const VK_RETURN: u8 = 0x0D;
 const VK_VOLUME_MUTE: u8 = 0xAD;
-const VK_VOLUME_DOWN: u8 = 0xAE;
-const VK_VOLUME_UP: u8 = 0xAF;
 const VK_MEDIA_NEXT: u8 = 0xB0;
 const VK_MEDIA_PREV: u8 = 0xB1;
 const VK_MEDIA_PLAY_PAUSE: u8 = 0xB3;
 
 /// Windows virtual-key codes for simple remote buttons.
-/// `home` and `play_pause` are reserved for vertical mouse-wheel scrolling.
+/// `volume_up` and `volume_down` are mapped to vertical mouse-wheel scrolling.
 fn vk_for_button(name: &str) -> Option<u8> {
     Some(match name {
         "up" => 0x26,
@@ -97,14 +95,13 @@ fn vk_for_button(name: &str) -> Option<u8> {
         "left" | "rewind" => 0x25,
         "right" | "fast_forward" => 0x27,
         "menu" => 0x1B,                         // Escape
+        "home" => 0x24,                         // Home
         "channel_up" | "page_up" => 0x21,       // Page Up
         "channel_down" | "page_down" => 0x22,   // Page Down
         "guide" => 0x09,                        // Tab
         "play" | "pause" => VK_MEDIA_PLAY_PAUSE,
         "next" | "next_track" => VK_MEDIA_NEXT,
         "prev" | "previous" | "prev_track" | "previous_track" => VK_MEDIA_PREV,
-        "volume_up" => VK_VOLUME_UP,
-        "volume_down" => VK_VOLUME_DOWN,
         "mute" => VK_VOLUME_MUTE,
         _ => return None,
     })
@@ -112,8 +109,8 @@ fn vk_for_button(name: &str) -> Option<u8> {
 
 fn scroll_delta_for_button(name: &str) -> Option<i32> {
     match name {
-        "play_pause" => Some(WHEEL_DELTA),
-        "home" => Some(-WHEEL_DELTA),
+        "volume_up" => Some(WHEEL_DELTA),
+        "volume_down" => Some(-WHEEL_DELTA),
         _ => None,
     }
 }
@@ -151,32 +148,84 @@ fn send_inputs(inputs: &[Input]) {
     }
 }
 
-/// Update tracked remote input buffer and return `(backspaces, text_to_insert)`.
-fn plan_text_edit(buf: &mut String, op: &TextOp) -> (u32, String) {
-    match op {
-        TextOp::Insert(text) => {
-            buf.push_str(text);
-            (0, text.clone())
-        }
-        TextOp::Delete(count) => {
-            for _ in 0..*count {
-                if buf.pop().is_none() {
-                    break;
+#[derive(Default)]
+struct TextTracker {
+    buffer: String,
+    last_edit_at: Option<Instant>,
+    last_replace: Option<(String, Instant)>,
+    last_insert: Option<(String, Instant)>,
+}
+
+impl TextTracker {
+    fn reset(&mut self) {
+        self.buffer.clear();
+        self.last_edit_at = None;
+        self.last_replace = None;
+        self.last_insert = None;
+    }
+
+    /// Update tracked remote input buffer and return `(backspaces, text_to_insert)`.
+    /// Deduplicates redundant `Replace`/`Insert` pairs and immediate multi-character
+    /// IME/dictation repeats (e.g. "你好" -> "你好你好").
+    fn plan(&mut self, op: &TextOp, now: Instant) -> (u32, String) {
+        match op {
+            TextOp::Insert(text) => {
+                if text.is_empty() {
+                    return (0, String::new());
                 }
+                if let Some((ref replaced, t)) = self.last_replace {
+                    if now.duration_since(t) <= Duration::from_millis(300)
+                        && self.buffer == *replaced
+                        && replaced.ends_with(text)
+                    {
+                        return (0, String::new());
+                    }
+                }
+                if text.chars().count() >= 2 {
+                    let is_dup_insert = self.last_insert.as_ref().is_some_and(|(prev, t)| {
+                        prev == text && now.duration_since(*t) <= Duration::from_millis(250)
+                    });
+                    let already_committed_suffix = self.buffer.ends_with(text)
+                        && self
+                            .last_edit_at
+                            .is_some_and(|t| now.duration_since(t) <= Duration::from_millis(250));
+                    if is_dup_insert || already_committed_suffix {
+                        return (0, String::new());
+                    }
+                }
+                self.buffer.push_str(text);
+                self.last_edit_at = Some(now);
+                self.last_insert = Some((text.clone(), now));
+                self.last_replace = None;
+                (0, text.clone())
             }
-            (*count, String::new())
-        }
-        TextOp::Replace(target) => {
-            let common_chars = buf
-                .chars()
-                .zip(target.chars())
-                .take_while(|(a, b)| a == b)
-                .count();
-            let old_chars = buf.chars().count();
-            let backspaces = u32::try_from(old_chars - common_chars).unwrap_or(u32::MAX);
-            let insert: String = target.chars().skip(common_chars).collect();
-            *buf = target.clone();
-            (backspaces, insert)
+            TextOp::Delete(count) => {
+                for _ in 0..*count {
+                    if self.buffer.pop().is_none() {
+                        break;
+                    }
+                }
+                self.last_edit_at = Some(now);
+                self.last_insert = None;
+                self.last_replace = None;
+                (*count, String::new())
+            }
+            TextOp::Replace(target) => {
+                let common_chars = self
+                    .buffer
+                    .chars()
+                    .zip(target.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let old_chars = self.buffer.chars().count();
+                let backspaces = u32::try_from(old_chars - common_chars).unwrap_or(u32::MAX);
+                let insert: String = target.chars().skip(common_chars).collect();
+                self.buffer = target.clone();
+                self.last_edit_at = Some(now);
+                self.last_replace = Some((target.clone(), now));
+                self.last_insert = None;
+                (backspaces, insert)
+            }
         }
     }
 }
@@ -260,7 +309,10 @@ pub struct WinDelegate {
     cursor: Mutex<(f64, f64)>,
     scroll_gen: Arc<AtomicU32>,
     scroll_pressed_active: AtomicBool,
-    text_buffer: Mutex<String>,
+    text_tracker: Mutex<TextTracker>,
+    /// (last click time, click count) for play/pause multi-click detection.
+    play_clicks: Arc<Mutex<(Instant, u32)>>,
+    play_gen: Arc<AtomicU32>,
 }
 
 impl WinDelegate {
@@ -276,12 +328,14 @@ impl WinDelegate {
             cursor: Mutex::new(cursor_pos()),
             scroll_gen: Arc::new(AtomicU32::new(0)),
             scroll_pressed_active: AtomicBool::new(false),
-            text_buffer: Mutex::new(String::new()),
+            text_tracker: Mutex::new(TextTracker::default()),
+            play_clicks: Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), 0))),
+            play_gen: Arc::new(AtomicU32::new(0)),
         }
     }
 
     pub fn reset_text_buffer(&self) {
-        self.text_buffer.lock().unwrap().clear();
+        self.text_tracker.lock().unwrap().reset();
     }
 
     fn cancel_scroll(&self) {
@@ -356,6 +410,42 @@ impl WinDelegate {
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         }
     }
+
+    /// Single click: play/pause, double: next track, triple: previous track.
+    fn handle_play_pause(&self) {
+        let count = {
+            let mut s = self.play_clicks.lock().unwrap();
+            let now = Instant::now();
+            s.1 = if now.duration_since(s.0) <= Duration::from_millis(380) { s.1 + 1 } else { 1 };
+            s.0 = now;
+            s.1
+        };
+        let gen = self.play_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        if count >= 3 {
+            self.play_clicks.lock().unwrap().1 = 0;
+            info!("[Windows] media previous track (triple-click)");
+            return press_key(VK_MEDIA_PREV);
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (clicks, gen_ref) = (self.play_clicks.clone(), self.play_gen.clone());
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if gen_ref.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let n = std::mem::take(&mut clicks.lock().unwrap().1);
+            match n {
+                1 => press_key(VK_MEDIA_PLAY_PAUSE),
+                2 => {
+                    info!("[Windows] media next track (double-click)");
+                    press_key(VK_MEDIA_NEXT)
+                }
+                _ => {}
+            }
+        });
+    }
 }
 
 impl AtvDelegate for WinDelegate {
@@ -395,6 +485,7 @@ impl AtvDelegate for WinDelegate {
         match name {
             "select" if self.mouse_mode.load(Ordering::SeqCst) => self.mouse_click(),
             "select" => press_key(VK_RETURN),
+            "play_pause" => self.handle_play_pause(),
             "siri" | "toggle_mode" => {
                 let m = !self.mouse_mode.load(Ordering::SeqCst);
                 self.mouse_mode.store(m, Ordering::SeqCst);
@@ -410,10 +501,14 @@ impl AtvDelegate for WinDelegate {
     fn on_text(&self, op: TextOp) {
         self.wake_display_if_asleep();
         self.log(&format!("text: {op:?}"));
+        let now = Instant::now();
         let (backspaces, insert) = {
-            let mut buf = self.text_buffer.lock().unwrap();
-            plan_text_edit(&mut buf, &op)
+            let mut tracker = self.text_tracker.lock().unwrap();
+            tracker.plan(&op, now)
         };
+        if backspaces == 0 && insert.is_empty() {
+            return;
+        }
         let inputs = build_text_inputs(backspaces, &insert);
         send_inputs(&inputs);
     }
@@ -493,33 +588,90 @@ mod tests {
 
     #[test]
     fn scroll_button_mapping() {
-        assert_eq!(scroll_delta_for_button("play_pause"), Some(WHEEL_DELTA));
-        assert_eq!(scroll_delta_for_button("home"), Some(-WHEEL_DELTA));
+        assert_eq!(scroll_delta_for_button("volume_up"), Some(WHEEL_DELTA));
+        assert_eq!(scroll_delta_for_button("volume_down"), Some(-WHEEL_DELTA));
+        assert_eq!(scroll_delta_for_button("play_pause"), None);
+        assert_eq!(scroll_delta_for_button("home"), None);
         assert_eq!(scroll_delta_for_button("menu"), None);
         assert_eq!(vk_for_button("menu"), Some(0x1B));
-        assert_eq!(vk_for_button("home"), None);
+        assert_eq!(vk_for_button("home"), Some(0x24));
+        assert_eq!(vk_for_button("volume_up"), None);
+        assert_eq!(vk_for_button("volume_down"), None);
     }
 
     #[test]
     fn text_edit_plans_insert_delete_and_replace() {
-        let mut buf = String::new();
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
         assert_eq!(
-            plan_text_edit(&mut buf, &TextOp::Insert("你好".into())),
+            tracker.plan(&TextOp::Insert("你好".into()), t0),
             (0, "你好".into())
         );
         assert_eq!(
-            plan_text_edit(&mut buf, &TextOp::Replace("你好世界".into())),
+            tracker.plan(&TextOp::Replace("你好世界".into()), t0 + Duration::from_millis(50)),
             (0, "世界".into())
         );
         assert_eq!(
-            plan_text_edit(&mut buf, &TextOp::Replace("你好天界".into())),
+            tracker.plan(&TextOp::Replace("你好天界".into()), t0 + Duration::from_millis(100)),
             (2, "天界".into())
         );
         assert_eq!(
-            plan_text_edit(&mut buf, &TextOp::Delete(1)),
+            tracker.plan(&TextOp::Delete(1), t0 + Duration::from_millis(150)),
             (1, String::new())
         );
-        assert_eq!(buf, "你好天");
+        assert_eq!(tracker.buffer, "你好天");
+    }
+
+    #[test]
+    fn text_edit_deduplicates_repeated_chinese_and_dictation_ops() {
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
+
+        // 1. Insert("你好") followed by identical Replace("你好") -> no duplicate output
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("你好".into()), t0),
+            (0, "你好".into())
+        );
+        assert_eq!(
+            tracker.plan(&TextOp::Replace("你好".into()), t0 + Duration::from_millis(30)),
+            (0, String::new())
+        );
+
+        // 2. Replace("你好") immediately followed by redundant Insert("你好") -> suppressed
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("你好".into()), t0 + Duration::from_millis(60)),
+            (0, String::new())
+        );
+        assert_eq!(tracker.buffer, "你好");
+
+        // 3. Duplicate multi-char Insert("世界") within 250ms -> suppressed
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("世界".into()), t0 + Duration::from_millis(400)),
+            (0, "世界".into())
+        );
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("世界".into()), t0 + Duration::from_millis(450)),
+            (0, String::new())
+        );
+        assert_eq!(tracker.buffer, "你好世界");
+
+        // 4. Separate intentional multi-char input later (>250ms) still types normally
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("世界".into()), t0 + Duration::from_millis(900)),
+            (0, "世界".into())
+        );
+        assert_eq!(tracker.buffer, "你好世界世界");
+
+        // 5. Rapid single-char taps ("a" + "a") are NOT suppressed
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("a".into()), t0 + Duration::from_millis(950)),
+            (0, "a".into())
+        );
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("a".into()), t0 + Duration::from_millis(970)),
+            (0, "a".into())
+        );
+        assert_eq!(tracker.buffer, "你好世界世界aa");
     }
 
     #[test]
