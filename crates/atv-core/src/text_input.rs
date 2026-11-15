@@ -218,6 +218,23 @@ impl TextInputHub {
             .retain(|_, tx| pushes.iter().all(|push| tx.send(push.clone()).is_ok()));
     }
 
+    /// Clear tracked text and rotate the RTI session UUID so connected phones
+    /// reload an empty document (used when a host without native field
+    /// observation submits or moves past the current text).
+    pub fn reset_session(&self) {
+        let mut state = self.lock();
+        state.text.clear();
+        state.session_uuid = rand::random();
+        if !state.focused {
+            return;
+        }
+        let tid = build_document_state(&state.session_uuid, "");
+        let pushes = [TextInputPush::Stopped, TextInputPush::Started(tid)];
+        state
+            .clients
+            .retain(|_, tx| pushes.iter().all(|push| tx.send(push.clone()).is_ok()));
+    }
+
     /// A connection sent `_tiStart`: remember it and return the `_tiD` to
     /// answer with, or `None` when no field is focused.
     pub fn subscribe(&self, conn_id: u64, tx: UnboundedSender<TextInputPush>) -> Option<Vec<u8>> {
@@ -230,7 +247,11 @@ impl TextInputHub {
 
     /// The connection sent `_tiStop` or went away.
     pub fn unsubscribe(&self, conn_id: u64) {
-        self.lock().clients.remove(&conn_id);
+        let mut state = self.lock();
+        state.clients.remove(&conn_id);
+        if state.clients.is_empty() && state.focused {
+            state.session_uuid = rand::random();
+        }
     }
 }
 
@@ -405,5 +426,41 @@ mod tests {
         // Reporting the same state again pushes nothing.
         hub.set_focus(true, "query", "", false);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn hub_rotates_session_uuid_when_last_client_unsubscribes() {
+        let hub = TextInputHub::new();
+        let (tx1, _rx1) = unbounded_channel();
+        let (tx2, _rx2) = unbounded_channel();
+
+        hub.set_focus(true, "windows-input", "", false);
+        let tid1 = hub.subscribe(1, tx1).unwrap();
+        let (uuid1, text1) = document(&tid1);
+        assert_eq!(text1, "");
+
+        hub.unsubscribe(1);
+
+        let tid2 = hub.subscribe(2, tx2).unwrap();
+        let (uuid2, text2) = document(&tid2);
+        assert_eq!(text2, "");
+        assert_ne!(uuid1, uuid2);
+    }
+
+    #[test]
+    fn hub_reset_session_clears_text_and_reloads_with_new_uuid() {
+        let hub = TextInputHub::new();
+        let (tx, mut rx) = unbounded_channel();
+
+        hub.set_focus(true, "windows-input", "你好", false);
+        let tid1 = hub.subscribe(1, tx).unwrap();
+        let (uuid1, text1) = document(&tid1);
+        assert_eq!(text1, "你好");
+
+        hub.reset_session();
+        assert_eq!(rx.try_recv(), Ok(TextInputPush::Stopped));
+        let (uuid2, text2) = expect_started(&mut rx);
+        assert_eq!(text2, "");
+        assert_ne!(uuid2, uuid1);
     }
 }

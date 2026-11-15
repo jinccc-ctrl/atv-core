@@ -154,6 +154,7 @@ struct TextTracker {
     last_edit_at: Option<Instant>,
     last_replace: Option<(String, Instant)>,
     last_insert: Option<(String, Instant)>,
+    stale_after_reset: Option<(String, Instant)>,
 }
 
 impl TextTracker {
@@ -162,6 +163,19 @@ impl TextTracker {
         self.last_edit_at = None;
         self.last_replace = None;
         self.last_insert = None;
+        self.stale_after_reset = None;
+    }
+
+    fn reset_after_submit(&mut self, now: Instant) {
+        let prev = std::mem::take(&mut self.buffer);
+        self.last_edit_at = None;
+        self.last_replace = None;
+        self.last_insert = None;
+        self.stale_after_reset = (!prev.is_empty()).then_some((prev, now));
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
     }
 
     /// Update tracked remote input buffer and return `(backspaces, text_to_insert)`.
@@ -193,6 +207,7 @@ impl TextTracker {
                         return (0, String::new());
                     }
                 }
+                self.stale_after_reset = None;
                 self.buffer.push_str(text);
                 self.last_edit_at = Some(now);
                 self.last_insert = Some((text.clone(), now));
@@ -200,6 +215,7 @@ impl TextTracker {
                 (0, text.clone())
             }
             TextOp::Delete(count) => {
+                self.stale_after_reset = None;
                 for _ in 0..*count {
                     if self.buffer.pop().is_none() {
                         break;
@@ -211,6 +227,18 @@ impl TextTracker {
                 (*count, String::new())
             }
             TextOp::Replace(target) => {
+                if self.buffer.is_empty() {
+                    if let Some((ref prev, t)) = self.stale_after_reset {
+                        if now.duration_since(t) <= Duration::from_millis(400) {
+                            let prev_trimmed = prev.trim_end_matches(['\r', '\n']);
+                            let target_trimmed = target.trim_end_matches(['\r', '\n']);
+                            if !target_trimmed.is_empty() && prev_trimmed == target_trimmed {
+                                return (0, String::new());
+                            }
+                        }
+                    }
+                }
+                self.stale_after_reset = None;
                 let common_chars = self
                     .buffer
                     .chars()
@@ -310,6 +338,7 @@ pub struct WinDelegate {
     scroll_gen: Arc<AtomicU32>,
     scroll_pressed_active: AtomicBool,
     text_tracker: Mutex<TextTracker>,
+    text_input: Mutex<Option<Arc<atv_core::text_input::TextInputHub>>>,
     /// (last click time, click count) for play/pause multi-click detection.
     play_clicks: Arc<Mutex<(Instant, u32)>>,
     play_gen: Arc<AtomicU32>,
@@ -329,13 +358,25 @@ impl WinDelegate {
             scroll_gen: Arc::new(AtomicU32::new(0)),
             scroll_pressed_active: AtomicBool::new(false),
             text_tracker: Mutex::new(TextTracker::default()),
+            text_input: Mutex::new(None),
             play_clicks: Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), 0))),
             play_gen: Arc::new(AtomicU32::new(0)),
         }
     }
 
+    pub fn set_text_input(&self, hub: Option<Arc<atv_core::text_input::TextInputHub>>) {
+        *self.text_input.lock().unwrap() = hub;
+    }
+
     pub fn reset_text_buffer(&self) {
         self.text_tracker.lock().unwrap().reset();
+    }
+
+    fn reset_text_session_at(&self, now: Instant) {
+        self.text_tracker.lock().unwrap().reset_after_submit(now);
+        if let Some(hub) = self.text_input.lock().unwrap().clone() {
+            hub.reset_session();
+        }
     }
 
     fn cancel_scroll(&self) {
@@ -483,8 +524,18 @@ impl AtvDelegate for WinDelegate {
             return;
         }
         match name {
-            "select" if self.mouse_mode.load(Ordering::SeqCst) => self.mouse_click(),
-            "select" => press_key(VK_RETURN),
+            "select" if self.mouse_mode.load(Ordering::SeqCst) => {
+                self.mouse_click();
+                if !self.text_tracker.lock().unwrap().is_empty() {
+                    self.reset_text_session_at(Instant::now());
+                }
+            }
+            "select" => {
+                press_key(VK_RETURN);
+                if !self.text_tracker.lock().unwrap().is_empty() {
+                    self.reset_text_session_at(Instant::now());
+                }
+            }
             "play_pause" => self.handle_play_pause(),
             "siri" | "toggle_mode" => {
                 let m = !self.mouse_mode.load(Ordering::SeqCst);
@@ -509,8 +560,16 @@ impl AtvDelegate for WinDelegate {
         if backspaces == 0 && insert.is_empty() {
             return;
         }
+        let submitted = insert.contains('\n') || insert.contains('\r');
         let inputs = build_text_inputs(backspaces, &insert);
         send_inputs(&inputs);
+        if submitted {
+            self.reset_text_session_at(now);
+        }
+    }
+
+    fn on_text_stopped(&self) {
+        self.reset_text_buffer();
     }
 
     fn on_touch(&self, dx: f64, dy: f64, phase: TouchPhase) {
@@ -557,7 +616,12 @@ impl AtvDelegate for WinDelegate {
 
     fn on_event(&self, kind: EventKind, detail: &str) {
         match kind {
-            EventKind::MouseClick => self.mouse_click(),
+            EventKind::MouseClick => {
+                self.mouse_click();
+                if !self.text_tracker.lock().unwrap().is_empty() {
+                    self.reset_text_session_at(Instant::now());
+                }
+            }
             EventKind::ClientConnected => info!("[Windows] iPhone connected: {detail}"),
             EventKind::ClientDisconnected => {
                 self.cancel_scroll();
@@ -686,5 +750,43 @@ mod tests {
             assert_eq!(inputs[8].u.ki.w_scan, 0xD83D);
             assert_eq!(inputs[10].u.ki.w_scan, 0xDE00);
         }
+    }
+
+    #[test]
+    fn text_edit_does_not_accumulate_across_submit_or_session_reset() {
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
+
+        // 1st input: "你好" + Return -> reset after submit
+        assert_eq!(
+            tracker.plan(&TextOp::Replace("你好".into()), t0),
+            (0, "你好".into())
+        );
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("\n".into()), t0 + Duration::from_millis(50)),
+            (0, "\n".into())
+        );
+        tracker.reset_after_submit(t0 + Duration::from_millis(50));
+        assert!(tracker.is_empty());
+
+        // Stale in-flight Replace("你好") within 400ms is dropped rather than re-typed
+        assert_eq!(
+            tracker.plan(&TextOp::Replace("你好".into()), t0 + Duration::from_millis(120)),
+            (0, String::new())
+        );
+
+        // 2nd input: "哈哈" -> only "哈哈" is typed
+        assert_eq!(
+            tracker.plan(&TextOp::Replace("哈哈".into()), t0 + Duration::from_millis(500)),
+            (0, "哈哈".into())
+        );
+        tracker.reset_after_submit(t0 + Duration::from_millis(600));
+
+        // 3rd input: "哦哦" -> only "哦哦" is typed
+        assert_eq!(
+            tracker.plan(&TextOp::Replace("哦哦".into()), t0 + Duration::from_millis(1200)),
+            (0, "哦哦".into())
+        );
+        assert_eq!(tracker.buffer, "哦哦");
     }
 }

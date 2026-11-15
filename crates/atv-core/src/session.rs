@@ -666,6 +666,7 @@ impl CompanionSession {
             Some("_sessionStop") => {
                 self.session_established.store(false, Ordering::SeqCst);
                 self.inspector.session_stopped();
+                self.text_input.unsubscribe(self.conn_id);
                 self.send_response(xid, None, 0).await?;
                 info!("<< _sessionStop: remote session closed");
                 self.delegate
@@ -699,6 +700,7 @@ impl CompanionSession {
                 *self.timeout_deadline.lock().await = None;
                 // The phone closed its remote; stop pushing focus changes to it.
                 self.text_input.unsubscribe(self.conn_id);
+                self.delegate.on_text_stopped();
                 self.send_response(xid, None, 0).await?;
             }
             Some("_interest") => {

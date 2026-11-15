@@ -326,8 +326,13 @@ async fn main() {
     };
 
     #[cfg(windows)]
-    if args.target == Target::Mac && args.keyboard_input {
-        server.set_text_focus(true, "windows-input", "", false);
+    {
+        if let Some(d) = &win_delegate {
+            d.set_text_input(Some(server.text_input_hub()));
+        }
+        if args.target == Target::Mac && args.keyboard_input {
+            server.set_text_focus(true, "windows-input", "", false);
+        }
     }
 
     let identity = server.identity();
@@ -478,6 +483,10 @@ async fn main() {
                     Some(tray::TrayCmd::ToggleService) => {
                         if let Some(srv) = current_server.take() {
                             println!("Stopping simulator service via tray...");
+                            if let Some(d) = &win_delegate {
+                                d.set_text_input(None);
+                                d.reset_text_buffer();
+                            }
                             srv.stop().await;
                             is_running.store(false, std::sync::atomic::Ordering::SeqCst);
                             tray::update_status(false, "");
@@ -493,6 +502,7 @@ async fn main() {
                                 Ok(srv) => {
                                     println!("Simulator service started.");
                                     if let Some(d) = &win_delegate {
+                                        d.set_text_input(Some(srv.text_input_hub()));
                                         d.reset_text_buffer();
                                     }
                                     if keyboard_enabled.load(std::sync::atomic::Ordering::SeqCst) {

@@ -643,16 +643,16 @@
         <div class="driver-body">
           <div class="slider-row">
             <span class="slider-label">🐢 慢速精细 (0.2x)</span>
-            <input type="range" id="speedSlider" min="0.2" max="3.0" step="0.05" value="0.5" oninput="onSliderInput(this.value)" onchange="onSliderChange(this.value)">
+            <input type="range" id="speedSlider" min="0.2" max="3.0" step="0.05" value="0.5" onpointerdown="startSliderDrag()" onmousedown="startSliderDrag()" ontouchstart="startSliderDrag()" oninput="onSliderInput(this.value)" onchange="onSliderChange(this.value)">
             <span class="slider-label">🚀 极速大屏 (3.0x)</span>
           </div>
 
           <div class="preset-group">
             <span class="preset-label">快速预设:</span>
-            <button class="p-btn active" data-speed="0.5" onclick="setSpeedPreset(0.5)">🐢 0.5x 慢速精准 (默认)</button>
-            <button class="p-btn" data-speed="1.0" onclick="setSpeedPreset(1.0)">🎯 1.0x 标准舒适</button>
-            <button class="p-btn" data-speed="1.5" onclick="setSpeedPreset(1.5)">⚡ 1.5x 快速顺畅</button>
-            <button class="p-btn" data-speed="2.2" onclick="setSpeedPreset(2.2)">🚀 2.2x 极速大屏</button>
+            <button type="button" class="p-btn active" data-speed="0.5" onclick="setSpeedPreset(0.5)">🐢 0.5x 慢速精准 (默认)</button>
+            <button type="button" class="p-btn" data-speed="1.0" onclick="setSpeedPreset(1.0)">🎯 1.0x 标准舒适</button>
+            <button type="button" class="p-btn" data-speed="1.5" onclick="setSpeedPreset(1.5)">⚡ 1.5x 快速顺畅</button>
+            <button type="button" class="p-btn" data-speed="2.2" onclick="setSpeedPreset(2.2)">🚀 2.2x 极速大屏</button>
           </div>
         </div>
 
@@ -945,6 +945,9 @@
     let curVerbose = false;
     let screenBounds = null;
     let speedDebounceTimer = null;
+    let isDraggingSlider = false;
+    let settingsRequestSeq = 0;
+    let appliedSettingsSeq = 0;
     let clientConnected = false;
     let clientPeer = null;
     let sessionReady = false;
@@ -971,14 +974,16 @@
       return 'mouse';
     }
 
-    function updateTouchpadUI(settings) {
+    function updateTouchpadUI(settings, uiOpts = {}) {
       if (!settings) return;
       if (settings.mode !== undefined && settings.mode !== null) {
         curMode = normalizeMode(settings.mode);
       } else if (typeof settings.mouse_mode === 'boolean') {
         curMode = settings.mouse_mode ? 'mouse' : 'direction';
       }
-      if (typeof settings.speed === 'number') curSpeed = settings.speed;
+      if (typeof settings.speed === 'number' && !Number.isNaN(settings.speed)) {
+        curSpeed = settings.speed;
+      }
       if (typeof settings.accel === 'boolean') curAccel = settings.accel;
       if (typeof settings.verbose_events === 'boolean') curVerbose = settings.verbose_events;
 
@@ -1043,14 +1048,16 @@
         verbText.textContent = curVerbose ? '📢 事件日志: 开启 (Info)' : '🔇 事件日志: 静默 (Debug)';
       }
 
-      // 滑块刻度同步
+      // 滑块刻度同步（拖动期间不覆写 slider.value，避免打断指针拖动）
       const slider = $('speedSlider');
-      if (slider) slider.value = curSpeed;
+      if (slider && (!isDraggingSlider || uiOpts.forceSlider)) {
+        slider.value = curSpeed;
+      }
 
       // 预设档位高亮
       document.querySelectorAll('.preset-group .p-btn').forEach(btn => {
         const val = Number(btn.getAttribute('data-speed'));
-        btn.classList.toggle('active', Math.abs(val - curSpeed) < 0.08);
+        btn.classList.toggle('active', Math.abs(val - curSpeed) < 0.04);
       });
 
       // 实时配置与运行状态记录表更新
@@ -1108,6 +1115,7 @@
     }
 
     async function sendTouchpadSettings(opts) {
+      const reqSeq = ++settingsRequestSeq;
       try {
         const targetMode = opts.mode !== undefined ? normalizeMode(opts.mode) : curMode;
         const payload = {
@@ -1122,8 +1130,12 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        updateTouchpadUI(data);
+        appliedSettingsSeq = Math.max(appliedSettingsSeq, reqSeq);
+        if (reqSeq >= settingsRequestSeq) {
+          updateTouchpadUI(data);
+        }
       } catch (e) {
         console.error('Failed to update touchpad settings:', e);
       }
@@ -1151,24 +1163,49 @@
       sendTouchpadSettings({ verbose_events: !curVerbose });
     }
 
+    function startSliderDrag() {
+      isDraggingSlider = true;
+    }
+
+    function endSliderDrag() {
+      isDraggingSlider = false;
+    }
+
+    window.addEventListener('pointerup', endSliderDrag);
+    window.addEventListener('mouseup', endSliderDrag);
+    window.addEventListener('touchend', endSliderDrag);
+    window.addEventListener('blur', endSliderDrag);
+
     function setSpeedPreset(speed) {
+      isDraggingSlider = false;
       clearTimeout(speedDebounceTimer);
+      updateTouchpadUI({ speed }, { forceSlider: true });
       sendTouchpadSettings({ speed });
     }
 
     function onSliderInput(val) {
       const speed = parseFloat(val);
+      if (Number.isNaN(speed)) return;
+      curSpeed = speed;
       $('speedDisplay').textContent = formatSpeedDesc(speed);
       $('recSpeed').textContent = `${speed.toFixed(2)}x (${formatSpeedDetail(speed)})`;
+      document.querySelectorAll('.preset-group .p-btn').forEach(btn => {
+        const bVal = Number(btn.getAttribute('data-speed'));
+        btn.classList.toggle('active', Math.abs(bVal - curSpeed) < 0.04);
+      });
       clearTimeout(speedDebounceTimer);
       speedDebounceTimer = setTimeout(() => {
         sendTouchpadSettings({ speed });
-      }, 40);
+      }, 100);
     }
 
     function onSliderChange(val) {
+      isDraggingSlider = false;
       clearTimeout(speedDebounceTimer);
-      sendTouchpadSettings({ speed: parseFloat(val) });
+      const speed = parseFloat(val);
+      if (Number.isNaN(speed)) return;
+      updateTouchpadUI({ speed }, { forceSlider: true });
+      sendTouchpadSettings({ speed });
     }
 
     function updateClientStatusBadge() {
@@ -1319,7 +1356,9 @@
             updateTouchpadUI(packet.data || {});
           }
           if (packet.event === 'touchpad_settings' || packet.event === 'mouse_settings') {
-            updateTouchpadUI(packet.data || {});
+            if (!isDraggingSlider && settingsRequestSeq <= appliedSettingsSeq) {
+              updateTouchpadUI(packet.data || {});
+            }
           }
           if (packet.event === 'client_connected') {
             clientConnected = true;

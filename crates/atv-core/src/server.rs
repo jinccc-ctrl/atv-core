@@ -485,6 +485,12 @@ impl AtvServer {
         self.text_input.set_focus(focused, field, text, from_phone);
     }
 
+    /// Access the shared RTI text input hub (e.g. to reset/reload the phone's
+    /// remote keyboard bar after submitting a line on desktop hosts).
+    pub fn text_input_hub(&self) -> Arc<TextInputHub> {
+        self.text_input.clone()
+    }
+
     /// Unregister Bonjour services and stop all listeners.
     pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
@@ -810,6 +816,89 @@ async fn ui_loop(
     }
 }
 
+const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024;
+
+fn parse_content_length(headers: &str) -> usize {
+    for line in headers.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = value.trim().parse::<usize>() {
+                    return len.min(MAX_HTTP_REQUEST_BYTES);
+                }
+            }
+        }
+    }
+    0
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
+    let mut expected_total: Option<usize> = None;
+
+    let read_res = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(total) = expected_total {
+                if buf.len() >= total {
+                    return true;
+                }
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) => return !buf.is_empty(),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let end = pos + 4;
+                            let headers = String::from_utf8_lossy(&buf[..end]);
+                            let content_len = parse_content_length(&headers);
+                            expected_total = Some((end + content_len).min(MAX_HTTP_REQUEST_BYTES));
+                        }
+                    }
+                    if buf.len() >= MAX_HTTP_REQUEST_BYTES {
+                        return true;
+                    }
+                    if let Some(total) = expected_total {
+                        if buf.len() >= total {
+                            return true;
+                        }
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+
+    match read_res {
+        Ok(true) => Some(String::from_utf8_lossy(&buf).into_owned()),
+        _ => (!buf.is_empty()).then(|| String::from_utf8_lossy(&buf).into_owned()),
+    }
+}
+
+async fn send_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let header = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    if stream.write_all(header.as_bytes()).await.is_ok() && !body.is_empty() {
+        let _ = stream.write_all(body.as_bytes()).await;
+    }
+    let _ = stream.flush().await;
+}
+
 async fn handle_ui_client(
     mut stream: TcpStream,
     inspector: Arc<InspectorHub>,
@@ -820,12 +909,9 @@ async fn handle_ui_client(
 ) {
     use tokio::io::AsyncWriteExt;
 
-    let mut buf = vec![0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let Some(req) = read_http_request(&mut stream).await else {
+        return;
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
     let first_line = req.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -837,18 +923,8 @@ async fn handle_ui_client(
 
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
-            let body = DASHBOARD_HTML.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(body).await;
-            let _ = stream.flush().await;
+            send_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", DASHBOARD_HTML)
+                .await;
         }
         ("GET", "/debug") | ("GET", "/debug/") | ("GET", "/logs") => {
             let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:8766/\r\nConnection: close\r\n\r\n";
@@ -1044,15 +1120,14 @@ async fn handle_ui_client(
                         cur_mode.is_mouse()
                     ),
                 );
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"mode\":\"{}\",\"mouse_mode\":{},\"speed\":{:.2},\"accel\":{},\"verbose_events\":{}}}",
+                let json = format!(
+                    "{{\"status\":\"ok\",\"mode\":\"{}\",\"mouse_mode\":{},\"speed\":{:.2},\"accel\":{},\"verbose_events\":{}}}",
                     cur_mode.as_str(), cur_mode.is_mouse(), new_speed, new_accel, new_verbose
                 );
-                let _ = stream.write_all(resp.as_bytes()).await;
+                send_http_response(&mut stream, "200 OK", "application/json", &json).await;
                 return;
             }
-            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            let _ = stream.write_all(resp.as_bytes()).await;
+            send_http_response(&mut stream, "400 Bad Request", "text/plain", "").await;
         }
         ("GET", "/api/status") | ("GET", "/api/mode") => {
             let cur_mode = TrackpadMode::from_u8(trackpad_mode.load(Ordering::SeqCst));
@@ -1071,11 +1146,11 @@ async fn handle_ui_client(
                 Some((vol, muted)) => format!("{{\"volume\":{vol:.2},\"muted\":{muted}}}"),
                 None => "null".to_string(),
             };
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"server_online\":true,\"mode\":\"{}\",\"mouse_mode\":{},\"device_name\":\"{}\",\"mouse_speed\":{:.2},\"mouse_accel\":{},\"verbose_events\":{},\"screen_size\":{},\"client_connected\":{},\"client_peer\":{},\"session_ready\":{},\"audio\":{}}}",
+            let json = format!(
+                "{{\"status\":\"ok\",\"server_online\":true,\"mode\":\"{}\",\"mouse_mode\":{},\"device_name\":\"{}\",\"mouse_speed\":{:.2},\"mouse_accel\":{},\"verbose_events\":{},\"screen_size\":{},\"client_connected\":{},\"client_peer\":{},\"session_ready\":{},\"audio\":{}}}",
                 cur_mode.as_str(), is_mouse, device_name, speed, accel, verbose_events, screen_json, client_conn, peer_json, session_ready, audio_json
             );
-            let _ = stream.write_all(resp.as_bytes()).await;
+            send_http_response(&mut stream, "200 OK", "application/json", &json).await;
             return;
         }
         ("GET", "/favicon.ico") => {
@@ -1125,9 +1200,11 @@ fn extract_float_from_json(json: &str, key: &str) -> Option<f64> {
     let rest = rest[colon + 1..].trim_start();
     let num_str: String = rest
         .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .take_while(|c| {
+            c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+' || *c == 'e' || *c == 'E'
+        })
         .collect();
-    num_str.parse().ok()
+    num_str.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 fn extract_bool_from_json(json: &str, key: &str) -> Option<bool> {
@@ -1227,5 +1304,48 @@ fn peer_string(stream: &TcpStream) -> String {
         .peer_addr()
         .map(|a: SocketAddr| a.to_string())
         .unwrap_or_else(|_| "?".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn extract_float_parses_ints_and_decimals() {
+        assert_eq!(extract_float_from_json(r#"{"speed":1}"#, "speed"), Some(1.0));
+        assert_eq!(extract_float_from_json(r#"{"speed":0.5}"#, "speed"), Some(0.5));
+        assert_eq!(extract_float_from_json(r#"{"speed": 2.2}"#, "speed"), Some(2.2));
+        assert_eq!(extract_float_from_json(r#"{"mode":"mouse"}"#, "speed"), None);
+    }
+
+    #[tokio::test]
+    async fn read_http_request_waits_for_split_json_body() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"mode":"mouse","mouse_mode":true,"speed":1.5,"accel":true,"verbose_events":false}"#;
+
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            let headers = format!(
+                "POST /api/touchpad_settings HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(headers.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sock.write_all(body.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let req = read_http_request(&mut server_stream).await.unwrap();
+        client.await.unwrap();
+
+        let pos = req.find("\r\n\r\n").unwrap();
+        let parsed_body = &req[pos + 4..];
+        assert_eq!(parsed_body, body);
+        assert_eq!(extract_float_from_json(parsed_body, "speed"), Some(1.5));
+    }
 }
 

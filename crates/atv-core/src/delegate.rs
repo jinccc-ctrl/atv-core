@@ -151,6 +151,9 @@ pub trait AtvDelegate: Send + Sync + 'static {
     /// a focused field.
     fn on_text(&self, _op: TextOp) {}
 
+    /// The phone closed or ended its remote text input session (`_tiStop`).
+    fn on_text_stopped(&self) {}
+
     /// Lifecycle/state event with a human-readable detail string.
     fn on_event(&self, _kind: EventKind, _detail: &str) {}
 
