@@ -6,9 +6,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use atv_core::{AtvDelegate, EventKind, TouchPhase, TrackpadMode};
+use atv_core::{AtvDelegate, EventKind, TextOp, TouchPhase, TrackpadMode};
 use tracing::{debug, info, warn};
 
 #[repr(C)]
@@ -18,10 +18,50 @@ struct Point {
     y: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct MouseInput {
+    dx: i32,
+    dy: i32,
+    mouse_data: u32,
+    dw_flags: u32,
+    time: u32,
+    dw_extra_info: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct KeybdInput {
+    w_vk: u16,
+    w_scan: u16,
+    dw_flags: u32,
+    time: u32,
+    dw_extra_info: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union InputUnion {
+    #[allow(dead_code)]
+    mi: MouseInput,
+    ki: KeybdInput,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Input {
+    kind: u32,
+    u: InputUnion,
+}
+
 #[link(name = "user32")]
 extern "system" {
     fn keybd_event(vk: u8, scan: u8, flags: u32, extra: usize);
     fn mouse_event(flags: u32, dx: i32, dy: i32, data: u32, extra: usize);
+    fn SendInput(count: u32, inputs: *const Input, cb_size: i32) -> u32;
     fn GetCursorPos(p: *mut Point) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetSystemMetrics(index: i32) -> i32;
@@ -29,12 +69,17 @@ extern "system" {
     fn SetProcessDPIAware() -> i32;
 }
 
+const INPUT_KEYBOARD: u32 = 1;
 const KEYEVENTF_EXTENDEDKEY: u32 = 0x1;
 const KEYEVENTF_KEYUP: u32 = 0x2;
+const KEYEVENTF_UNICODE: u32 = 0x4;
 const MOUSEEVENTF_MOVE: u32 = 0x1;
 const MOUSEEVENTF_LEFTDOWN: u32 = 0x2;
 const MOUSEEVENTF_LEFTUP: u32 = 0x4;
+const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+const WHEEL_DELTA: i32 = 120;
 
+const VK_BACK: u8 = 0x08;
 const VK_RETURN: u8 = 0x0D;
 const VK_VOLUME_MUTE: u8 = 0xAD;
 const VK_VOLUME_DOWN: u8 = 0xAE;
@@ -44,6 +89,7 @@ const VK_MEDIA_PREV: u8 = 0xB1;
 const VK_MEDIA_PLAY_PAUSE: u8 = 0xB3;
 
 /// Windows virtual-key codes for simple remote buttons.
+/// `home` and `play_pause` are reserved for vertical mouse-wheel scrolling.
 fn vk_for_button(name: &str) -> Option<u8> {
     Some(match name {
         "up" => 0x26,
@@ -51,7 +97,6 @@ fn vk_for_button(name: &str) -> Option<u8> {
         "left" | "rewind" => 0x25,
         "right" | "fast_forward" => 0x27,
         "menu" => 0x1B,                         // Escape
-        "home" => 0x24,                         // Home
         "channel_up" | "page_up" => 0x21,       // Page Up
         "channel_down" | "page_down" => 0x22,   // Page Down
         "guide" => 0x09,                        // Tab
@@ -63,6 +108,110 @@ fn vk_for_button(name: &str) -> Option<u8> {
         "mute" => VK_VOLUME_MUTE,
         _ => return None,
     })
+}
+
+fn scroll_delta_for_button(name: &str) -> Option<i32> {
+    match name {
+        "play_pause" => Some(WHEEL_DELTA),
+        "home" => Some(-WHEEL_DELTA),
+        _ => None,
+    }
+}
+
+fn mouse_wheel(delta: i32) {
+    unsafe {
+        mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta as u32, 0);
+    }
+}
+
+fn key_input(vk: u16, scan: u16, flags: u32) -> Input {
+    Input {
+        kind: INPUT_KEYBOARD,
+        u: InputUnion {
+            ki: KeybdInput {
+                w_vk: vk,
+                w_scan: scan,
+                dw_flags: flags,
+                time: 0,
+                dw_extra_info: 0,
+            },
+        },
+    }
+}
+
+fn send_inputs(inputs: &[Input]) {
+    if inputs.is_empty() {
+        return;
+    }
+    let size = std::mem::size_of::<Input>() as i32;
+    for chunk in inputs.chunks(200) {
+        unsafe {
+            SendInput(chunk.len() as u32, chunk.as_ptr(), size);
+        }
+    }
+}
+
+/// Update tracked remote input buffer and return `(backspaces, text_to_insert)`.
+fn plan_text_edit(buf: &mut String, op: &TextOp) -> (u32, String) {
+    match op {
+        TextOp::Insert(text) => {
+            buf.push_str(text);
+            (0, text.clone())
+        }
+        TextOp::Delete(count) => {
+            for _ in 0..*count {
+                if buf.pop().is_none() {
+                    break;
+                }
+            }
+            (*count, String::new())
+        }
+        TextOp::Replace(target) => {
+            let common_chars = buf
+                .chars()
+                .zip(target.chars())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let old_chars = buf.chars().count();
+            let backspaces = u32::try_from(old_chars - common_chars).unwrap_or(u32::MAX);
+            let insert: String = target.chars().skip(common_chars).collect();
+            *buf = target.clone();
+            (backspaces, insert)
+        }
+    }
+}
+
+fn build_text_inputs(backspaces: u32, text: &str) -> Vec<Input> {
+    let cap = (backspaces as usize).saturating_add(text.len()) * 2;
+    let mut inputs = Vec::with_capacity(cap.min(1024));
+    for _ in 0..backspaces {
+        inputs.push(key_input(VK_BACK as u16, 0, 0));
+        inputs.push(key_input(VK_BACK as u16, 0, KEYEVENTF_KEYUP));
+    }
+    let mut prev_cr = false;
+    for ch in text.chars() {
+        if ch == '\r' {
+            inputs.push(key_input(VK_RETURN as u16, 0, 0));
+            inputs.push(key_input(VK_RETURN as u16, 0, KEYEVENTF_KEYUP));
+            prev_cr = true;
+            continue;
+        }
+        if ch == '\n' {
+            if !prev_cr {
+                inputs.push(key_input(VK_RETURN as u16, 0, 0));
+                inputs.push(key_input(VK_RETURN as u16, 0, KEYEVENTF_KEYUP));
+            }
+            prev_cr = false;
+            continue;
+        }
+        prev_cr = false;
+        let mut utf16 = [0u16; 2];
+        for &unit in ch.encode_utf16(&mut utf16) {
+            inputs.push(key_input(0, unit, KEYEVENTF_UNICODE));
+            inputs.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+        }
+    }
+    inputs
 }
 
 fn press_key(vk: u8) {
@@ -109,9 +258,9 @@ pub struct WinDelegate {
     verbose_events: AtomicBool,
     display_asleep: AtomicBool,
     cursor: Mutex<(f64, f64)>,
-    /// (last click time, click count) for play/pause multi-click detection.
-    play_clicks: Arc<Mutex<(Instant, u32)>>,
-    play_gen: Arc<AtomicU32>,
+    scroll_gen: Arc<AtomicU32>,
+    scroll_pressed_active: AtomicBool,
+    text_buffer: Mutex<String>,
 }
 
 impl WinDelegate {
@@ -125,9 +274,48 @@ impl WinDelegate {
             verbose_events: AtomicBool::new(verbose),
             display_asleep: AtomicBool::new(false),
             cursor: Mutex::new(cursor_pos()),
-            play_clicks: Arc::new(Mutex::new((Instant::now() - Duration::from_secs(10), 0))),
-            play_gen: Arc::new(AtomicU32::new(0)),
+            scroll_gen: Arc::new(AtomicU32::new(0)),
+            scroll_pressed_active: AtomicBool::new(false),
+            text_buffer: Mutex::new(String::new()),
         }
+    }
+
+    pub fn reset_text_buffer(&self) {
+        self.text_buffer.lock().unwrap().clear();
+    }
+
+    fn cancel_scroll(&self) {
+        self.scroll_gen.fetch_add(1, Ordering::SeqCst);
+        self.scroll_pressed_active.store(false, Ordering::SeqCst);
+    }
+
+    fn wake_display_if_asleep(&self) {
+        if self.display_asleep.swap(false, Ordering::SeqCst) {
+            set_monitor_power(true);
+        }
+    }
+
+    fn start_scroll_hold(&self, delta: i32) {
+        self.wake_display_if_asleep();
+        self.scroll_pressed_active.store(true, Ordering::SeqCst);
+        let gen = self.scroll_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        mouse_wheel(delta);
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let gen_ref = self.scroll_gen.clone();
+        handle.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(280)).await;
+            // Safety cap (~10s) prevents runaway scrolling if a release packet is lost.
+            for _ in 0..110 {
+                if gen_ref.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                mouse_wheel(delta);
+                tokio::time::sleep(Duration::from_millis(90)).await;
+            }
+        });
     }
 
     fn log(&self, msg: &str) {
@@ -168,42 +356,23 @@ impl WinDelegate {
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         }
     }
-
-    /// Single click: play/pause, double: next track, triple: previous track.
-    fn handle_play_pause(&self) {
-        let count = {
-            let mut s = self.play_clicks.lock().unwrap();
-            let now = Instant::now();
-            s.1 = if now.duration_since(s.0) <= Duration::from_millis(380) { s.1 + 1 } else { 1 };
-            s.0 = now;
-            s.1
-        };
-        let gen = self.play_gen.fetch_add(1, Ordering::SeqCst) + 1;
-        if count >= 3 {
-            self.play_clicks.lock().unwrap().1 = 0;
-            info!("[Windows] media previous track (triple-click)");
-            return press_key(VK_MEDIA_PREV);
-        }
-        let (clicks, gen_ref) = (self.play_clicks.clone(), self.play_gen.clone());
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            if gen_ref.load(Ordering::SeqCst) != gen {
-                return;
-            }
-            let n = std::mem::take(&mut clicks.lock().unwrap().1);
-            match n {
-                1 => press_key(VK_MEDIA_PLAY_PAUSE),
-                2 => {
-                    info!("[Windows] media next track (double-click)");
-                    press_key(VK_MEDIA_NEXT)
-                }
-                _ => {}
-            }
-        });
-    }
 }
 
 impl AtvDelegate for WinDelegate {
+    fn on_button_state(&self, name: &str, pressed: bool) {
+        if scroll_delta_for_button(name).is_none() {
+            return;
+        }
+        if pressed {
+            if let Some(delta) = scroll_delta_for_button(name) {
+                self.start_scroll_hold(delta);
+            }
+        } else {
+            // Stop hold-repeat; `on_button` right after consumes `scroll_pressed_active`.
+            self.scroll_gen.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn on_button(&self, name: &str) {
         self.log(&format!("button: {name}"));
         if name == "power" || name == "sleep" || name == "wake" {
@@ -215,13 +384,17 @@ impl AtvDelegate for WinDelegate {
             self.display_asleep.store(sleep, Ordering::SeqCst);
             return set_monitor_power(!sleep);
         }
-        if self.display_asleep.swap(false, Ordering::SeqCst) {
-            set_monitor_power(true);
+        self.wake_display_if_asleep();
+        if let Some(delta) = scroll_delta_for_button(name) {
+            if !self.scroll_pressed_active.swap(false, Ordering::SeqCst) {
+                // Synthetic callers (e.g. Web UI) trigger `on_button` without button-down.
+                mouse_wheel(delta);
+            }
+            return;
         }
         match name {
             "select" if self.mouse_mode.load(Ordering::SeqCst) => self.mouse_click(),
             "select" => press_key(VK_RETURN),
-            "play_pause" => self.handle_play_pause(),
             "siri" | "toggle_mode" => {
                 let m = !self.mouse_mode.load(Ordering::SeqCst);
                 self.mouse_mode.store(m, Ordering::SeqCst);
@@ -232,6 +405,17 @@ impl AtvDelegate for WinDelegate {
                 None => warn!("[Windows] no handler for button: {name}"),
             },
         }
+    }
+
+    fn on_text(&self, op: TextOp) {
+        self.wake_display_if_asleep();
+        self.log(&format!("text: {op:?}"));
+        let (backspaces, insert) = {
+            let mut buf = self.text_buffer.lock().unwrap();
+            plan_text_edit(&mut buf, &op)
+        };
+        let inputs = build_text_inputs(backspaces, &insert);
+        send_inputs(&inputs);
     }
 
     fn on_touch(&self, dx: f64, dy: f64, phase: TouchPhase) {
@@ -280,8 +464,75 @@ impl AtvDelegate for WinDelegate {
         match kind {
             EventKind::MouseClick => self.mouse_click(),
             EventKind::ClientConnected => info!("[Windows] iPhone connected: {detail}"),
-            EventKind::ClientDisconnected => info!("[Windows] iPhone disconnected: {detail}"),
+            EventKind::ClientDisconnected => {
+                self.cancel_scroll();
+                self.reset_text_buffer();
+                info!("[Windows] iPhone disconnected: {detail}");
+            }
+            EventKind::SessionStopped => {
+                self.cancel_scroll();
+                self.reset_text_buffer();
+                self.log(&format!("event: {kind:?} {detail}"));
+            }
             _ => self.log(&format!("event: {kind:?} {detail}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_struct_matches_win32_abi() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(std::mem::size_of::<Input>(), 40);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(std::mem::size_of::<Input>(), 28);
+    }
+
+    #[test]
+    fn scroll_button_mapping() {
+        assert_eq!(scroll_delta_for_button("play_pause"), Some(WHEEL_DELTA));
+        assert_eq!(scroll_delta_for_button("home"), Some(-WHEEL_DELTA));
+        assert_eq!(scroll_delta_for_button("menu"), None);
+        assert_eq!(vk_for_button("menu"), Some(0x1B));
+        assert_eq!(vk_for_button("home"), None);
+    }
+
+    #[test]
+    fn text_edit_plans_insert_delete_and_replace() {
+        let mut buf = String::new();
+        assert_eq!(
+            plan_text_edit(&mut buf, &TextOp::Insert("你好".into())),
+            (0, "你好".into())
+        );
+        assert_eq!(
+            plan_text_edit(&mut buf, &TextOp::Replace("你好世界".into())),
+            (0, "世界".into())
+        );
+        assert_eq!(
+            plan_text_edit(&mut buf, &TextOp::Replace("你好天界".into())),
+            (2, "天界".into())
+        );
+        assert_eq!(
+            plan_text_edit(&mut buf, &TextOp::Delete(1)),
+            (1, String::new())
+        );
+        assert_eq!(buf, "你好天");
+    }
+
+    #[test]
+    fn build_text_inputs_handles_newline_and_surrogates() {
+        let inputs = build_text_inputs(1, "a\r\nb😀");
+        // 1 backspace (2) + 'a' (2) + '\r\n' (2) + 'b' (2) + '😀' 2 UTF-16 units (4) = 12 events
+        assert_eq!(inputs.len(), 12);
+        unsafe {
+            assert_eq!(inputs[0].u.ki.w_vk, VK_BACK as u16);
+            assert_eq!(inputs[4].u.ki.w_vk, VK_RETURN as u16);
+            assert_eq!(inputs[8].u.ki.dw_flags, KEYEVENTF_UNICODE);
+            assert_eq!(inputs[8].u.ki.w_scan, 0xD83D);
+            assert_eq!(inputs[10].u.ki.w_scan, 0xDE00);
         }
     }
 }

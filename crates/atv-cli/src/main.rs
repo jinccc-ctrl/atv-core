@@ -51,6 +51,7 @@ fn usage() -> ! {
            --no-ui                        Disable Debug Web UI\n\
            --open                         Automatically open Debug UI in default browser (default on Windows)\n\
            --no-open                      Do not open Debug UI automatically\n\
+           --no-keyboard                  Disable automatic iPhone keyboard input focus on Windows\n\
            -h, --help                     Show this help message"
     );
     exit(2);
@@ -65,6 +66,8 @@ struct CliArgs {
     verbose_events: bool,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     prompt_accessibility: bool,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    keyboard_input: bool,
 }
 
 fn parse_args() -> CliArgs {
@@ -81,6 +84,7 @@ fn parse_args() -> CliArgs {
     let mut mouse_mode_explicit = false;
     let mut mouse_speed_explicit = false;
     let mut prompt_accessibility = true;
+    let mut keyboard_input = true;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -169,6 +173,7 @@ fn parse_args() -> CliArgs {
             "--no-ui" => config.ui_port = None,
             "--open" => open_browser = true,
             "--no-open" => open_browser = false,
+            "--no-keyboard" => keyboard_input = false,
             "-h" | "--help" => usage(),
             _ => usage(),
         }
@@ -211,6 +216,7 @@ fn parse_args() -> CliArgs {
         open_browser,
         verbose_events,
         prompt_accessibility,
+        keyboard_input,
     }
 }
 
@@ -254,6 +260,9 @@ async fn main() {
     let mouse_mode = Arc::new(std::sync::atomic::AtomicBool::new(args.config.mouse_mode));
     let open_browser = args.open_browser;
 
+    #[cfg(windows)]
+    let mut win_delegate: Option<Arc<windows::WinDelegate>> = None;
+
     let delegate: Arc<dyn AtvDelegate> = match args.target {
         Target::Mac => {
             #[cfg(target_os = "macos")]
@@ -276,12 +285,14 @@ async fn main() {
             #[cfg(windows)]
             {
                 let settings = atv_core::UserSettings::load();
-                Arc::new(windows::WinDelegate::new(
+                let d = Arc::new(windows::WinDelegate::new(
                     mouse_mode.clone(),
                     args.config.mouse_speed,
                     settings.mouse_accel.unwrap_or(true),
                     args.verbose_events || settings.verbose_events.unwrap_or(false),
-                ))
+                ));
+                win_delegate = Some(d.clone());
+                d
             }
             #[cfg(not(any(target_os = "macos", windows)))]
             {
@@ -313,6 +324,11 @@ async fn main() {
             exit(1);
         }
     };
+
+    #[cfg(windows)]
+    if args.target == Target::Mac && args.keyboard_input {
+        server.set_text_focus(true, "windows-input", "", false);
+    }
 
     let identity = server.identity();
     println!("Device Name : \"{}\"", identity.name);
@@ -423,9 +439,18 @@ async fn main() {
     #[cfg(windows)]
     {
         let is_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let keyboard_enabled = Arc::new(std::sync::atomic::AtomicBool::new(
+            args.target == Target::Mac && args.keyboard_input,
+        ));
         let title = format!("Apple TV Remote · {} · PIN {:04}", server.identity().name, server.config().pin);
         let url = server.ui_port().map(|p| format!("http://127.0.0.1:{p}"));
-        let mut rx = tray::spawn(title, url, trackpad_mode.clone(), is_running.clone());
+        let mut rx = tray::spawn(
+            title,
+            url,
+            trackpad_mode.clone(),
+            is_running.clone(),
+            keyboard_enabled.clone(),
+        );
 
         let mut current_server: Option<AtvServer> = Some(server);
         let config = args.config;
@@ -438,6 +463,16 @@ async fn main() {
                     Some(tray::TrayCmd::Mode(m)) => {
                         if let Some(srv) = &current_server {
                             srv.set_trackpad_mode(m);
+                        }
+                    }
+                    Some(tray::TrayCmd::ToggleKeyboard) => {
+                        let next = !keyboard_enabled.load(std::sync::atomic::Ordering::SeqCst);
+                        keyboard_enabled.store(next, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(d) = &win_delegate {
+                            d.reset_text_buffer();
+                        }
+                        if let Some(srv) = &current_server {
+                            srv.set_text_focus(next, "windows-input", "", false);
                         }
                     }
                     Some(tray::TrayCmd::ToggleService) => {
@@ -457,6 +492,12 @@ async fn main() {
                             ).await {
                                 Ok(srv) => {
                                     println!("Simulator service started.");
+                                    if let Some(d) = &win_delegate {
+                                        d.reset_text_buffer();
+                                    }
+                                    if keyboard_enabled.load(std::sync::atomic::Ordering::SeqCst) {
+                                        srv.set_text_focus(true, "windows-input", "", false);
+                                    }
                                     let info = format!("{} · PIN {:04}", srv.identity().name, srv.config().pin);
                                     tray::update_status(true, &info);
                                     current_server = Some(srv);

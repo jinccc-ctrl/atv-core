@@ -19,6 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 pub enum TrayCmd {
     Mode(TrackpadMode),
     ToggleService,
+    ToggleKeyboard,
     Quit,
 }
 
@@ -28,6 +29,7 @@ struct State {
     url: Option<String>,
     title: String,
     running: Arc<std::sync::atomic::AtomicBool>,
+    keyboard: Arc<std::sync::atomic::AtomicBool>,
 }
 
 static STATE: OnceLock<State> = OnceLock::new();
@@ -135,9 +137,10 @@ fn show_menu(hwnd: HWND, s: &State) {
     let mode = TrackpadMode::from_u8(s.mode.load(Ordering::SeqCst));
     let check = |m: TrackpadMode| if m == mode { MF_CHECKED } else { 0 };
     let mode_flags = if is_running { 0 } else { MF_GRAYED };
+    let kb_flags = mode_flags | if s.keyboard.load(Ordering::SeqCst) { MF_CHECKED } else { 0 };
     let auto = if autostart_enabled() { MF_CHECKED } else { 0 };
 
-    let items: [(u32, usize, String); 13] = [
+    let items: [(u32, usize, String); 14] = [
         (MF_GRAYED, 0, status_str),
         (MF_SEPARATOR, 0, String::new()),
         (0, 10, toggle_action_str.to_string()),
@@ -146,6 +149,7 @@ fn show_menu(hwnd: HWND, s: &State) {
         (mode_flags | check(TrackpadMode::Mouse), 2, "🖱️ 鼠标光标模式 (Mouse)".to_string()),
         (mode_flags | check(TrackpadMode::Direction), 3, "◀▲▼▶ 方向键模式 (D-pad)".to_string()),
         (mode_flags | check(TrackpadMode::Idle), 4, "👁️ 触控板空置模式 (Idle)".to_string()),
+        (kb_flags, 7, "⌨️ iPhone 键盘输入 (Keyboard Input)".to_string()),
         (MF_SEPARATOR, 0, String::new()),
         (auto, 5, "开机自启动 (Start at login)".to_string()),
         (0, 6, "打开日志文件 (Open log)".to_string()),
@@ -168,6 +172,7 @@ fn show_menu(hwnd: HWND, s: &State) {
             2 => drop(s.tx.send(TrayCmd::Mode(TrackpadMode::Mouse))),
             3 => drop(s.tx.send(TrayCmd::Mode(TrackpadMode::Direction))),
             4 => drop(s.tx.send(TrayCmd::Mode(TrackpadMode::Idle))),
+            7 => drop(s.tx.send(TrayCmd::ToggleKeyboard)),
             5 => set_autostart(!autostart_enabled()),
             6 => drop(Command::new("notepad").arg(log_path()).spawn()),
             9 => drop(s.tx.send(TrayCmd::Quit)),
@@ -202,6 +207,7 @@ pub fn spawn(
     url: Option<String>,
     mode: Arc<AtomicU8>,
     running: Arc<std::sync::atomic::AtomicBool>,
+    keyboard: Arc<std::sync::atomic::AtomicBool>,
 ) -> UnboundedReceiver<TrayCmd> {
     let (tx, rx) = unbounded_channel();
     let _ = STATE.set(State {
@@ -210,6 +216,7 @@ pub fn spawn(
         url,
         title,
         running,
+        keyboard,
     });
     std::thread::spawn(|| unsafe {
         let hinst = GetModuleHandleW(std::ptr::null());
