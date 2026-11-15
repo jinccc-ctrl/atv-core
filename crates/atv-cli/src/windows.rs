@@ -206,7 +206,7 @@ fn build_text_inputs(backspaces: u32, text: &str) -> Vec<Input> {
         }
         prev_cr = false;
         let mut utf16 = [0u16; 2];
-        for &unit in ch.encode_utf16(&mut utf16) {
+        for &mut unit in ch.encode_utf16(&mut utf16) {
             inputs.push(key_input(0, unit, KEYEVENTF_UNICODE));
             inputs.push(key_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
         }
