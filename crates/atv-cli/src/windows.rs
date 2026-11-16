@@ -187,6 +187,37 @@ impl TextTracker {
                 if text.is_empty() {
                     return (0, String::new());
                 }
+                // The phone sometimes reports the whole field contents instead of
+                // a delta (`insertionText` is cumulative after IME candidates and
+                // dictation), and it retries an edit it believes was not applied.
+                // Reconcile with what we already typed instead of appending.
+                if !self.buffer.is_empty() {
+                    if self.buffer == *text {
+                        return (0, String::new());
+                    }
+                    if let Some(delta) = text.strip_prefix(self.buffer.as_str()) {
+                        let delta = delta.to_string();
+                        self.stale_after_reset = None;
+                        self.buffer = text.clone();
+                        self.last_edit_at = Some(now);
+                        self.last_replace = None;
+                        if delta.is_empty() {
+                            self.last_insert = None;
+                            return (0, String::new());
+                        }
+                        self.last_insert = Some((delta.clone(), now));
+                        return (0, delta);
+                    }
+                    if let Some(dropped) = self.buffer.strip_prefix(text.as_str()) {
+                        let backspaces = u32::try_from(dropped.chars().count()).unwrap_or(u32::MAX);
+                        self.stale_after_reset = None;
+                        self.buffer = text.clone();
+                        self.last_edit_at = Some(now);
+                        self.last_insert = None;
+                        self.last_replace = None;
+                        return (backspaces, String::new());
+                    }
+                }
                 if let Some((ref replaced, t)) = self.last_replace {
                     if now.duration_since(t) <= Duration::from_millis(300)
                         && self.buffer == *replaced
@@ -736,6 +767,61 @@ mod tests {
             (0, "a".into())
         );
         assert_eq!(tracker.buffer, "你好世界世界aa");
+    }
+
+    #[test]
+    fn text_edit_reconciles_cumulative_inserts_from_iphone() {
+        // Captured from a real iPhone: the phone re-sends whole-field text
+        // ("你好" x6, then "世界", then "你好世界" x3, then " abcdef", ...).
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
+        let plan = |t: &mut TextTracker, text: &str, ms: u64| {
+            t.plan(&TextOp::Insert(text.into()), t0 + Duration::from_millis(ms))
+        };
+        assert_eq!(plan(&mut tracker, "你好", 0), (0, "你好".into()));
+        assert_eq!(plan(&mut tracker, "你好", 5), (0, String::new()));
+        assert_eq!(plan(&mut tracker, "你好", 3000), (0, String::new()));
+        assert_eq!(plan(&mut tracker, "世界", 3100), (0, "世界".into()));
+        assert_eq!(plan(&mut tracker, "你好世界", 3200), (0, String::new()));
+        assert_eq!(plan(&mut tracker, " abcdef", 9000), (0, " abcdef".into()));
+        assert_eq!(plan(&mut tracker, "你好世界 abcdef", 9100), (0, String::new()));
+        assert_eq!(tracker.buffer, "你好世界 abcdef");
+    }
+
+    #[test]
+    fn text_edit_trims_cumulative_assert_without_prior_delta() {
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("你好".into()), t0),
+            (0, "你好".into())
+        );
+        // Phone jumps straight to the full text: only the new suffix is typed.
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("你好世界".into()), t0 + Duration::from_millis(1000)),
+            (0, "世界".into())
+        );
+        // Phone reports a shorter text without deletionCount: backspace the tail.
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("你好".into()), t0 + Duration::from_millis(2000)),
+            (2, String::new())
+        );
+        assert_eq!(tracker.buffer, "你好");
+    }
+
+    #[test]
+    fn text_edit_still_appends_real_deltas() {
+        let mut tracker = TextTracker::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("abc".into()), t0),
+            (0, "abc".into())
+        );
+        assert_eq!(
+            tracker.plan(&TextOp::Insert("def".into()), t0 + Duration::from_millis(1000)),
+            (0, "def".into())
+        );
+        assert_eq!(tracker.buffer, "abcdef");
     }
 
     #[test]
