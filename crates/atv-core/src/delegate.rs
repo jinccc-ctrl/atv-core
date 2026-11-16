@@ -15,6 +15,20 @@ pub enum TouchPhase {
     Ended,
 }
 
+/// One edit typed on the phone's keyboard into the text field focused on the TV.
+///
+/// A single `_tiC` message may carry several operations; they are delivered
+/// in order: `Replace`, then `Delete`, then `Insert`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextOp {
+    /// Append text at the cursor. Return arrives as `"\n"`.
+    Insert(String),
+    /// Delete this many characters before the cursor (backspace sends 1).
+    Delete(u32),
+    /// Replace the whole field text (e.g. the phone cleared the field).
+    Replace(String),
+}
+
 /// Lifecycle and state events emitted by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -119,6 +133,10 @@ pub trait AtvDelegate: Send + Sync + 'static {
     /// surface also arrive here as directional buttons.
     fn on_button(&self, _name: &str) {}
 
+    /// Remote button press/release transition (`pressed = true` on button-down,
+    /// `pressed = false` on button-up). Useful for hold-to-repeat behaviors.
+    fn on_button_state(&self, _name: &str, _pressed: bool) {}
+
     /// Touch surface activity. `dx`/`dy` are deltas in phone touchpad units
     /// (the surface is 1000x1000). On `Began` the deltas are zero; on `Ended`
     /// they are the total displacement from the touch origin.
@@ -126,6 +144,15 @@ pub trait AtvDelegate: Send + Sync + 'static {
 
     /// Audio state changed: `volume` in 0.0-1.0 (16 steps), `muted` flag.
     fn on_audio(&self, _volume: f64, _muted: bool) {}
+
+    /// The phone's keyboard edited the focused text field. The phone raises
+    /// its keyboard only while
+    /// [`AtvServer::set_text_focus`](crate::AtvServer::set_text_focus) reports
+    /// a focused field.
+    fn on_text(&self, _op: TextOp) {}
+
+    /// The phone closed or ended its remote text input session (`_tiStop`).
+    fn on_text_stopped(&self) {}
 
     /// Lifecycle/state event with a human-readable detail string.
     fn on_event(&self, _kind: EventKind, _detail: &str) {}

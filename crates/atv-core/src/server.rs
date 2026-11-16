@@ -13,8 +13,9 @@ use std::time::Duration;
 #[cfg(not(target_os = "macos"))]
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::io::AsyncReadExt;
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -26,6 +27,7 @@ use crate::identity::{self, DeviceIdentity};
 use crate::inspector::InspectorHub;
 use crate::registry::{ActiveConnectionTracker, DeviceRegistry};
 use crate::session::{CompanionSession, DEVICE_MODEL};
+use crate::text_input::TextInputHub;
 use crate::FrameType;
 
 pub const MRP_PORT: u16 = 49152;
@@ -116,6 +118,7 @@ pub struct AtvServer {
     mouse_mode: Arc<AtomicBool>,
     trackpad_mode: Arc<AtomicU8>,
     delegate: Arc<dyn AtvDelegate>,
+    text_input: Arc<TextInputHub>,
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     #[cfg(target_os = "macos")]
@@ -180,6 +183,7 @@ impl AtvServer {
         let airplay_port = airplay_listener.local_addr()?.port();
 
         let inspector = InspectorHub::new();
+        let text_input = TextInputHub::new();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = Vec::new();
@@ -197,6 +201,7 @@ impl AtvServer {
             inspector.clone(),
             trackpad_mode.clone(),
             mouse_mode.clone(),
+            text_input.clone(),
             shutdown_rx.clone(),
         )));
 
@@ -377,6 +382,7 @@ impl AtvServer {
             mouse_mode,
             trackpad_mode,
             delegate,
+            text_input,
             shutdown_tx,
             tasks,
             #[cfg(target_os = "macos")]
@@ -468,6 +474,23 @@ impl AtvServer {
         new_mode.is_mouse()
     }
 
+    /// Report whether a text field is focused on the TV, which one (`field`
+    /// is any stable identity the host picks) and its current text.
+    /// `_tiStart` is answered from this state. Phones that sent it get
+    /// `_tiStarted` / `_tiStopped` when focus changes, and both in a row when
+    /// another field takes focus or the text changes on the TV side. Set
+    /// `from_phone` when the text changed only because the host applied edits
+    /// from [`AtvDelegate::on_text`]; the phone already shows those.
+    pub fn set_text_focus(&self, focused: bool, field: &str, text: &str, from_phone: bool) {
+        self.text_input.set_focus(focused, field, text, from_phone);
+    }
+
+    /// Access the shared RTI text input hub (e.g. to reset/reload the phone's
+    /// remote keyboard bar after submitting a line on desktop hosts).
+    pub fn text_input_hub(&self) -> Arc<TextInputHub> {
+        self.text_input.clone()
+    }
+
     /// Unregister Bonjour services and stop all listeners.
     pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
@@ -550,6 +573,7 @@ async fn companion_loop(
     inspector: Arc<InspectorHub>,
     trackpad_mode: Arc<AtomicU8>,
     mouse_mode: Arc<AtomicBool>,
+    text_input: Arc<TextInputHub>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let registry = Arc::new(Mutex::new(DeviceRegistry::new(Duration::from_secs(24 * 3600))));
@@ -573,13 +597,64 @@ async fn companion_loop(
         let mouse_mode = mouse_mode.clone();
         let registry = registry.clone();
         let active_tracker = active_tracker.clone();
+        let text_input = text_input.clone();
         let mut client_shutdown = shutdown.clone();
         tokio::spawn(async move {
             tokio::select! {
-                _ = handle_companion(stream, identity, pin, delegate, inspector, trackpad_mode, mouse_mode, registry, active_tracker) => {},
+                _ = handle_companion(stream, identity, pin, delegate, inspector, trackpad_mode, mouse_mode, registry, active_tracker, text_input) => {},
                 _ = client_shutdown.changed() => {},
             }
         });
+    }
+}
+
+const MAX_FRAME_LENGTH: usize = 2 * 1024 * 1024; // 2MB protection against malformed frames
+
+/// A whole Companion frame, or the disconnect reason once reading stops.
+type IncomingFrame = std::result::Result<(FrameType, [u8; 4], Vec<u8>), String>;
+
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Read frames on a task of their own. `read_exact` is not cancellation-safe,
+/// so the connection loop must not race it against other events; it selects
+/// on this channel instead, which can be cancelled between frames.
+async fn read_frames(mut reader: OwnedReadHalf, peer: String, tx: mpsc::Sender<IncomingFrame>) {
+    loop {
+        let mut header = [0u8; 4];
+        if let Err(e) = reader.read_exact(&mut header).await {
+            let reason = if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                "peer_closed".to_string()
+            } else {
+                format!("error:{e}")
+            };
+            let _ = tx.send(Err(reason)).await;
+            return;
+        }
+        let Some(frame_type) = FrameType::from_u8(header[0]) else {
+            warn!("unknown frame type {}", header[0]);
+            let _ = tx.send(Err(format!("error:unknown frame type {}", header[0]))).await;
+            return;
+        };
+        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
+        if length > MAX_FRAME_LENGTH {
+            warn!("companion frame exceeds limit: {length} bytes from {peer}");
+            let _ = tx.send(Err(format!("error:frame too large ({length} bytes)"))).await;
+            return;
+        }
+        let mut payload = vec![0u8; length];
+        if let Err(e) = reader.read_exact(&mut payload).await {
+            let _ = tx.send(Err(format!("incomplete_frame:{e}"))).await;
+            return;
+        }
+        if tx.send(Ok((frame_type, header, payload))).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -593,6 +668,7 @@ async fn handle_companion(
     mouse_mode: Arc<AtomicBool>,
     registry: Arc<Mutex<DeviceRegistry>>,
     active_tracker: Arc<Mutex<ActiveConnectionTracker>>,
+    text_input: Arc<TextInputHub>,
 ) {
     let peer_addr = stream.peer_addr().ok();
     let peer = peer_addr
@@ -614,8 +690,12 @@ async fn handle_companion(
         tracker.register(peer_ip, session_established.clone())
     };
 
-    let (mut reader, writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
+    let (frame_tx, mut frame_rx) = mpsc::channel::<IncomingFrame>(16);
+    // Aborted on drop too, so the socket closes when shutdown cancels this future.
+    let _reader_task = AbortOnDrop(tokio::spawn(read_frames(reader, peer.clone(), frame_tx)));
+    let (text_push_tx, mut text_push_rx) = mpsc::unbounded_channel();
     let mut session = CompanionSession::new(
         writer,
         delegate.clone(),
@@ -629,11 +709,11 @@ async fn handle_companion(
         conn_id,
         peer_ip.to_string(),
         session_established,
+        text_input.clone(),
+        text_push_tx,
     );
     let timeout_deadline = session.timeout_deadline();
     let mut disconnect_reason = "peer_closed".to_string();
-
-    const MAX_FRAME_LENGTH: usize = 2 * 1024 * 1024; // 2MB protection against malformed frames
 
     loop {
         let deadline = *timeout_deadline.lock().await;
@@ -646,17 +726,28 @@ async fn handle_companion(
             }
         };
 
-        let mut header = [0u8; 4];
         tokio::select! {
-            res = reader.read_exact(&mut header) => {
-                match res {
-                    Ok(_) => {}
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::UnexpectedEof {
-                            disconnect_reason = format!("error:{e}");
-                        }
+            frame = frame_rx.recv() => {
+                let (frame_type, header, payload) = match frame {
+                    Some(Ok(frame)) => frame,
+                    Some(Err(reason)) => {
+                        disconnect_reason = reason;
                         break;
                     }
+                    None => break,
+                };
+                debug!("companion frame={:?} length={}", frame_type, payload.len());
+                if let Err(e) = session.handle_frame(frame_type, &payload, &header).await {
+                    disconnect_reason = format!("error:{e}");
+                    warn!("companion error: {e}");
+                    break;
+                }
+            }
+            Some(push) = text_push_rx.recv() => {
+                if let Err(e) = session.push_text_input(push).await {
+                    disconnect_reason = format!("error:{e}");
+                    warn!("companion error: {e}");
+                    break;
                 }
             }
             _ = abort_rx.changed() => {
@@ -670,32 +761,13 @@ async fn handle_companion(
                     info!("companion connection from {peer} timed out without remote session; closing to free channel");
                     break;
                 }
+                // The session came up meanwhile: drop the deadline so it does not fire again.
+                *timeout_deadline.lock().await = None;
             }
-        }
-        let Some(frame_type) = FrameType::from_u8(header[0]) else {
-            disconnect_reason = format!("error:unknown frame type {}", header[0]);
-            warn!("unknown frame type {}", header[0]);
-            break;
-        };
-        let length = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
-        if length > MAX_FRAME_LENGTH {
-            disconnect_reason = format!("error:frame too large ({length} bytes)");
-            warn!("companion frame exceeds limit: {length} bytes from {peer}");
-            break;
-        }
-        let mut payload = vec![0u8; length];
-        if let Err(e) = reader.read_exact(&mut payload).await {
-            disconnect_reason = format!("incomplete_frame:{e}");
-            break;
-        }
-        debug!("companion frame={:?} length={length}", frame_type);
-        if let Err(e) = session.handle_frame(frame_type, &payload, &header).await {
-            disconnect_reason = format!("error:{e}");
-            warn!("companion error: {e}");
-            break;
         }
     }
 
+    text_input.unsubscribe(conn_id);
     {
         let mut tracker = active_tracker.lock().await;
         tracker.unregister(conn_id);
@@ -744,6 +816,89 @@ async fn ui_loop(
     }
 }
 
+const MAX_HTTP_REQUEST_BYTES: usize = 64 * 1024;
+
+fn parse_content_length(headers: &str) -> usize {
+    for line in headers.split("\r\n").skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                if let Ok(len) = value.trim().parse::<usize>() {
+                    return len.min(MAX_HTTP_REQUEST_BYTES);
+                }
+            }
+        }
+    }
+    0
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Option<String> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 2048];
+    let mut expected_total: Option<usize> = None;
+
+    let read_res = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(total) = expected_total {
+                if buf.len() >= total {
+                    return true;
+                }
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) => return !buf.is_empty(),
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if expected_total.is_none() {
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let end = pos + 4;
+                            let headers = String::from_utf8_lossy(&buf[..end]);
+                            let content_len = parse_content_length(&headers);
+                            expected_total = Some((end + content_len).min(MAX_HTTP_REQUEST_BYTES));
+                        }
+                    }
+                    if buf.len() >= MAX_HTTP_REQUEST_BYTES {
+                        return true;
+                    }
+                    if let Some(total) = expected_total {
+                        if buf.len() >= total {
+                            return true;
+                        }
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+
+    match read_res {
+        Ok(true) => Some(String::from_utf8_lossy(&buf).into_owned()),
+        _ => (!buf.is_empty()).then(|| String::from_utf8_lossy(&buf).into_owned()),
+    }
+}
+
+async fn send_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let header = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Cache-Control: no-store\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    if stream.write_all(header.as_bytes()).await.is_ok() && !body.is_empty() {
+        let _ = stream.write_all(body.as_bytes()).await;
+    }
+    let _ = stream.flush().await;
+}
+
 async fn handle_ui_client(
     mut stream: TcpStream,
     inspector: Arc<InspectorHub>,
@@ -754,12 +909,9 @@ async fn handle_ui_client(
 ) {
     use tokio::io::AsyncWriteExt;
 
-    let mut buf = vec![0u8; 4096];
-    let n = match stream.read(&mut buf).await {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let Some(req) = read_http_request(&mut stream).await else {
+        return;
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
     let first_line = req.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -771,18 +923,8 @@ async fn handle_ui_client(
 
     match (method, path) {
         ("GET", "/") | ("GET", "/index.html") => {
-            let body = DASHBOARD_HTML.as_bytes();
-            let header = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: text/html; charset=utf-8\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes()).await;
-            let _ = stream.write_all(body).await;
-            let _ = stream.flush().await;
+            send_http_response(&mut stream, "200 OK", "text/html; charset=utf-8", DASHBOARD_HTML)
+                .await;
         }
         ("GET", "/debug") | ("GET", "/debug/") | ("GET", "/logs") => {
             let resp = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:8766/\r\nConnection: close\r\n\r\n";
@@ -978,15 +1120,14 @@ async fn handle_ui_client(
                         cur_mode.is_mouse()
                     ),
                 );
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"mode\":\"{}\",\"mouse_mode\":{},\"speed\":{:.2},\"accel\":{},\"verbose_events\":{}}}",
+                let json = format!(
+                    "{{\"status\":\"ok\",\"mode\":\"{}\",\"mouse_mode\":{},\"speed\":{:.2},\"accel\":{},\"verbose_events\":{}}}",
                     cur_mode.as_str(), cur_mode.is_mouse(), new_speed, new_accel, new_verbose
                 );
-                let _ = stream.write_all(resp.as_bytes()).await;
+                send_http_response(&mut stream, "200 OK", "application/json", &json).await;
                 return;
             }
-            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            let _ = stream.write_all(resp.as_bytes()).await;
+            send_http_response(&mut stream, "400 Bad Request", "text/plain", "").await;
         }
         ("GET", "/api/status") | ("GET", "/api/mode") => {
             let cur_mode = TrackpadMode::from_u8(trackpad_mode.load(Ordering::SeqCst));
@@ -1005,11 +1146,11 @@ async fn handle_ui_client(
                 Some((vol, muted)) => format!("{{\"volume\":{vol:.2},\"muted\":{muted}}}"),
                 None => "null".to_string(),
             };
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{{\"status\":\"ok\",\"server_online\":true,\"mode\":\"{}\",\"mouse_mode\":{},\"device_name\":\"{}\",\"mouse_speed\":{:.2},\"mouse_accel\":{},\"verbose_events\":{},\"screen_size\":{},\"client_connected\":{},\"client_peer\":{},\"session_ready\":{},\"audio\":{}}}",
+            let json = format!(
+                "{{\"status\":\"ok\",\"server_online\":true,\"mode\":\"{}\",\"mouse_mode\":{},\"device_name\":\"{}\",\"mouse_speed\":{:.2},\"mouse_accel\":{},\"verbose_events\":{},\"screen_size\":{},\"client_connected\":{},\"client_peer\":{},\"session_ready\":{},\"audio\":{}}}",
                 cur_mode.as_str(), is_mouse, device_name, speed, accel, verbose_events, screen_json, client_conn, peer_json, session_ready, audio_json
             );
-            let _ = stream.write_all(resp.as_bytes()).await;
+            send_http_response(&mut stream, "200 OK", "application/json", &json).await;
             return;
         }
         ("GET", "/favicon.ico") => {
@@ -1059,9 +1200,11 @@ fn extract_float_from_json(json: &str, key: &str) -> Option<f64> {
     let rest = rest[colon + 1..].trim_start();
     let num_str: String = rest
         .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .take_while(|c| {
+            c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+' || *c == 'e' || *c == 'E'
+        })
         .collect();
-    num_str.parse().ok()
+    num_str.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 fn extract_bool_from_json(json: &str, key: &str) -> Option<bool> {
@@ -1161,5 +1304,48 @@ fn peer_string(stream: &TcpStream) -> String {
         .peer_addr()
         .map(|a: SocketAddr| a.to_string())
         .unwrap_or_else(|_| "?".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn extract_float_parses_ints_and_decimals() {
+        assert_eq!(extract_float_from_json(r#"{"speed":1}"#, "speed"), Some(1.0));
+        assert_eq!(extract_float_from_json(r#"{"speed":0.5}"#, "speed"), Some(0.5));
+        assert_eq!(extract_float_from_json(r#"{"speed": 2.2}"#, "speed"), Some(2.2));
+        assert_eq!(extract_float_from_json(r#"{"mode":"mouse"}"#, "speed"), None);
+    }
+
+    #[tokio::test]
+    async fn read_http_request_waits_for_split_json_body() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"mode":"mouse","mouse_mode":true,"speed":1.5,"accel":true,"verbose_events":false}"#;
+
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(addr).await.unwrap();
+            let headers = format!(
+                "POST /api/touchpad_settings HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(headers.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            sock.write_all(body.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        let req = read_http_request(&mut server_stream).await.unwrap();
+        client.await.unwrap();
+
+        let pos = req.find("\r\n\r\n").unwrap();
+        let parsed_body = &req[pos + 4..];
+        assert_eq!(parsed_body, body);
+        assert_eq!(extract_float_from_json(parsed_body, "speed"), Some(1.5));
+    }
 }
 
